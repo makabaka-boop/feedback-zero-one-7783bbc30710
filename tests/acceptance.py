@@ -25,11 +25,18 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ENTRY = os.path.join(ROOT, "flow_backend.py")
+TARGET_ENTRY = os.path.join(ROOT, "flow_target.py")
 
 sys.path.insert(0, ROOT)
 import flow_engine  # noqa: E402
 import flow_schema  # noqa: E402
 import flow_store  # noqa: E402
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def cli(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
@@ -212,6 +219,70 @@ class EngineTests(unittest.TestCase):
                                    ["s2", "送达", "sig1", "y"]])
         self.assertEqual(out["result"], ["y", "z"])
 
+    # -- 采集 --------------------------------------------------------------
+
+    def test_collect_intent_registered_and_completes(self):
+        state = flow_engine.build_tree(["串行", ["采集", "x"], ["计时", 1]])
+        flow_engine.settle(state)
+        creates = state["effects"]["creates"]
+        self.assertEqual(list(creates), ["[0]"])
+        self.assertEqual(creates["[0]"]["data"], "x")
+        self.assertIsNone(creates["[0]"]["response"])
+        self.assertEqual(flow_engine.status_of(state), "运行")
+        # The recorded answer makes the leaf ready; settlement is immediate.
+        creates["[0]"]["response"] = "x"
+        flow_engine.settle(state)
+        self.assertEqual(flow_engine.status_of(state), "运行")  # timer pending
+        flow_store._apply(state, ["c", "推进", 1])
+        flow_engine.settle(state, limit=1)
+        self.assertEqual(flow_engine.result_of(state), ["x", None])
+
+    def test_collect_root_registers_intent(self):
+        state = flow_engine.build_tree(["采集", "x"])
+        flow_engine.settle(state)
+        self.assertIn("[]", state["effects"]["creates"])
+        self.assertEqual(flow_engine.status_of(state), "运行")
+
+    def test_collect_loser_obligation(self):
+        state = flow_engine.build_tree(["竞速", ["采集", "x"], ["计时", 0]])
+        flow_engine.settle(state)
+        self.assertEqual(flow_engine.result_of(state), [1, None])
+        cancels = state["effects"]["cancels"]
+        self.assertEqual(list(cancels), ["[0]"])
+        self.assertFalse(cancels["[0]"]["confirmed"])
+        self.assertEqual(flow_engine.pending_cancellations(state), [[0]])
+
+    def test_collect_done_leaf_obligation_when_ancestor_loses(self):
+        flow = ["竞速", ["串行", ["采集", "x"], ["计时", 50]], ["计时", 1]]
+        state = flow_engine.build_tree(flow)
+        flow_engine.settle(state)
+        state["effects"]["creates"]["[0,0]"]["response"] = "x"
+        flow_engine.settle(state)
+        leaf = flow_engine.node_at_address(state, [0, 0])
+        self.assertEqual(leaf["status"], "done")
+        flow_store._apply(state, ["c", "推进", 1])
+        flow_engine.settle(state, limit=1)
+        self.assertEqual(flow_engine.result_of(state), [1, None])
+        self.assertIn("[0,0]", state["effects"]["cancels"])
+        # The completed leaf keeps its status and result.
+        self.assertEqual(leaf["status"], "done")
+        self.assertEqual(leaf["result"], "x")
+
+    def test_collect_pending_answer_obligation_and_late_answer_ignored(self):
+        state = flow_engine.build_tree(["竞速", ["采集", "x"], ["计时", 1]])
+        flow_engine.settle(state)
+        flow_store._apply(state, ["c", "推进", 1])
+        flow_engine.settle(state, limit=1)
+        self.assertEqual(flow_engine.result_of(state), [1, None])
+        self.assertIn("[0]", state["effects"]["cancels"])
+        # A late answer is recorded but must not change the settled result.
+        state["effects"]["creates"]["[0]"]["response"] = "x"
+        flow_engine.settle(state)
+        self.assertEqual(flow_engine.result_of(state), [1, None])
+        leaf = flow_engine.node_at_address(state, [0])
+        self.assertEqual(leaf["status"], "cancelled")
+        self.assertIsNone(leaf["result"])
+
 
 # ---------------------------------------------------------------------------
 # Validation tests
@@ -231,6 +302,12 @@ class ValidationTests(unittest.TestCase):
             (["并行"], []),
             (["竞速"], []),
             (["串行", ["计时", 1], ["计时", True]], [2, 1]),
+            (["采集"], []),
+            (["采集", "a", "b"], []),
+            (["采集", 1], [1]),
+            (["采集", None], [1]),
+            (["采集", True], [1]),
+            (["竞速", ["采集", 1], ["计时", 1]], [1, 1]),
             (["计时"], []),
             (["计时", 1, 2], []),
             (["等待", "a", "b"], []),
@@ -274,6 +351,8 @@ class ValidationTests(unittest.TestCase):
     def test_data_strings_allowed(self):
         flow_schema.validate_command(["a", "送达", "b", "hi"])
         flow_schema.validate_command(["a", "送达", "b", ""])
+        flow_schema.validate_flow(["采集", ""])
+        flow_schema.validate_flow(["采集", "任意字符串 data"])
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +468,19 @@ class CliTests(Base):
         # reopening; verify the receipt table survived too.
         receipt = self.submit(["s1", "送达", "b", "queued"])
         self.assertEqual(receipt, view)
+
+    def test_invalid_collect_leaf_rejected(self):
+        proc = cli("init", "--db", self.db, "--flow", '["采集",5]')
+        self.assertNotEqual(proc.returncode, 0)
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["path"], "$[1]")
+        # The rejection changed nothing: the db is still uninitialised.
+        proc = cli("query", "--db", self.db)
+        self.assertNotEqual(proc.returncode, 0)
+        proc = cli("init", "--db", self.db, "--flow", '["竞速",["采集","x"],["采集",true]]')
+        self.assertNotEqual(proc.returncode, 0)
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["path"], "$[2][1]")
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +617,14 @@ class HttpTests(Base):
         body = json.loads(ctx.exception.read().decode())
         self.assertEqual(body["error"]["path"], "$")
 
+    def test_http_invalid_collect_leaf_is_400(self):
+        status, body = self._http("POST", "/init", {"flow": ["采集", 5]})
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["path"], "$[1]")
+        # State untouched: the original flow still runs.
+        status, view = self._http("GET", "/query")
+        self.assertEqual((status, view["status"]), (200, "运行"))
+
     def test_http_restart_persistence(self):
         self._http("POST", "/command", ["s1", "送达", "b", "queued"])
         self.proc.terminate()
@@ -550,6 +650,309 @@ class HttpTests(Base):
         finally:
             proc2.terminate()
             proc2.wait(timeout=10)
+
+
+# ---------------------------------------------------------------------------
+# 采集 full-stack: backend + independent worker + persistent mock target
+# ---------------------------------------------------------------------------
+
+class CollectTests(Base):
+    worker_timeout = 3.0  # above the target's 2s hang so late answers arrive
+
+    def setUp(self):
+        super().setUp()
+        self.target_db = os.path.join(self.tmp, "target.db")
+        self.target_port = _free_port()
+        self.target_url = "http://127.0.0.1:%d" % self.target_port
+        self.target_proc = self._start_target()
+        self.worker_proc = None
+
+    def tearDown(self):
+        self._stop_worker()
+        self._stop_target()
+        super().tearDown()
+
+    # -- process management -------------------------------------------------
+
+    def _start_target(self, hang=2.0):
+        proc = subprocess.Popen(
+            [sys.executable, TARGET_ENTRY, "serve", "--db", self.target_db,
+             "--port", str(self.target_port), "--hang", str(hang)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+        for _ in range(100):
+            try:
+                with urllib.request.urlopen(
+                        self.target_url + "/health", timeout=1) as resp:
+                    if resp.status == 200:
+                        return proc
+            except Exception:
+                time.sleep(0.05)
+        proc.kill()
+        self.fail("target did not start")
+
+    def _stop_target(self, hard=False):
+        proc = getattr(self, "target_proc", None)
+        if proc is None:
+            return
+        proc.kill() if hard else proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        self.target_proc = None
+
+    def _start_worker(self):
+        self.worker_proc = subprocess.Popen(
+            [sys.executable, ENTRY, "worker", "--db", self.db,
+             "--target", self.target_url,
+             "--interval", "0.05", "--retry", "0.1",
+             "--timeout", str(self.worker_timeout)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+
+    def _stop_worker(self, hard=False):
+        proc = self.worker_proc
+        if proc is None:
+            return
+        proc.kill() if hard else proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        self.worker_proc = None
+
+    # -- helpers --------------------------------------------------------------
+
+    def wait_until(self, predicate, timeout=15.0, message="condition"):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if predicate():
+                    return
+            except Exception:
+                pass
+            time.sleep(0.05)
+        self.fail("timed out waiting for %s" % message)
+
+    def effects(self):
+        proc = cli("effects", "--db", self.db)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def target_state(self):
+        with urllib.request.urlopen(self.target_url + "/state", timeout=5) as resp:
+            return json.loads(resp.read().decode())
+
+    def set_control(self, **modes):
+        req = urllib.request.Request(self.target_url + "/control",
+                                     data=json.dumps(modes).encode(),
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode())
+
+    def leaf(self, address):
+        store = flow_store.Store(self.db)
+        try:
+            _, state = store._load()
+            return flow_engine.node_at_address(state, address)
+        finally:
+            store.close()
+
+    def intent_response(self, address):
+        store = flow_store.Store(self.db)
+        try:
+            _, state = store._load()
+            key = flow_schema.canonical_json(address)
+            return state["effects"]["creates"][key]["response"]
+        finally:
+            store.close()
+
+    # -- tests -----------------------------------------------------------------
+
+    def test_collect_root_completes(self):
+        view = self.init(["采集", "hello"])
+        self.assertEqual(view["status"], "运行")
+        self._start_worker()
+        self.wait_until(lambda: self.query()["status"] == "完成",
+                        message="collect completion")
+        self.assertEqual(self.query()["result"], "hello")
+        self.assertEqual(self.effects(), {"pending": []})
+        state = self.target_state()
+        self.assertEqual(state["artifacts"], {"[]": "hello"})
+        self.assertEqual(state["banned"], [])
+
+    def test_spec_example_hanging_create_then_timer_wins(self):
+        # [竞速,[采集,"x"],[计时,1]]: the create answer hangs, 推进 1 settles
+        # [1, null], the loser is cancelled and the remote artifact removed.
+        self.set_control(create="hang")
+        self.init(["竞速", ["采集", "x"], ["计时", 1]])
+        self._start_worker()
+        self.wait_until(lambda: self.target_state()["stats"]["create"] >= 1,
+                        message="create attempt")
+        receipt = self.submit(["c1", "推进", 1])
+        self.assertEqual(receipt, {"clock": 1, "status": "完成",
+                                   "result": [1, None], "backlog": []})
+        self.wait_until(lambda: self.effects()["pending"] == [],
+                        message="cancel confirmation")
+        state = self.target_state()
+        self.assertEqual(state["artifacts"], {})
+        self.assertIn("[0]", state["banned"])
+        leaf = self.leaf([0])
+        self.assertEqual(leaf["status"], "cancelled")
+        self.assertIsNone(leaf["result"])
+        # The hanging create eventually answers; the late answer is recorded
+        # but must not change the settled result.
+        self.wait_until(lambda: self.intent_response([0]) is not None,
+                        message="late create answer")
+        self.assertEqual(self.query(), {"clock": 1, "status": "完成",
+                                        "result": [1, None], "backlog": []})
+
+    def test_completed_collect_cancelled_by_ancestor(self):
+        flow = ["竞速", ["串行", ["采集", "x"], ["计时", 50]], ["计时", 1]]
+        self.init(flow)
+        self._start_worker()
+        self.wait_until(
+            lambda: (self.leaf([0, 0]) or {}).get("status") == "done",
+            message="collect done")
+        receipt = self.submit(["c1", "推进", 1])
+        self.assertEqual(receipt["status"], "完成")
+        self.assertEqual(receipt["result"], [1, None])
+        self.wait_until(lambda: self.effects()["pending"] == [],
+                        message="cancel confirmation")
+        state = self.target_state()
+        self.assertEqual(state["artifacts"], {})
+        self.assertIn("[0,0]", state["banned"])
+        leaf = self.leaf([0, 0])
+        self.assertEqual(leaf["status"], "done")
+        self.assertEqual(leaf["result"], "x")
+        self.assertEqual(self.query()["result"], [1, None])
+
+    def test_worker_killed_after_remote_accept_before_local_confirm(self):
+        # The target accepts the create and drops the response; the worker is
+        # hard-killed before recording anything.  A restarted worker resumes
+        # from the persisted intent and the create is idempotent remotely.
+        self.set_control(create="disconnect")
+        self.init(["采集", "x"])
+        self._start_worker()
+        self.wait_until(
+            lambda: self.target_state()["artifacts"].get("[]") == "x",
+            message="remote accept")
+        self._stop_worker(hard=True)
+        self.assertEqual(self.query()["status"], "运行")
+        self.set_control(create="normal")
+        self._start_worker()
+        self.wait_until(lambda: self.query()["status"] == "完成",
+                        message="completion after worker restart")
+        self.assertEqual(self.query()["result"], "x")
+        self.assertGreaterEqual(self.target_state()["stats"]["create"], 2)
+
+    def test_cancel_confirmed_only_after_comms_recover(self):
+        # The create answer hangs so the timer wins the race; the cancel is
+        # then accepted remotely but its response is dropped.
+        self.set_control(create="hang")
+        self.init(["竞速", ["采集", "x"], ["计时", 1]])
+        self._start_worker()
+        self.wait_until(lambda: self.target_state()["stats"]["create"] >= 1,
+                        message="create applied")
+        self.set_control(cancel="disconnect")
+        receipt = self.submit(["c1", "推进", 1])
+        self.assertEqual(receipt["result"], [1, None])
+        # The remote applies the cancel but drops the response: the duty
+        # stays pending and survives a hard kill of the worker.
+        self.wait_until(lambda: "[0]" in self.target_state()["banned"],
+                        message="remote cancel")
+        self.assertEqual(self.effects(), {"pending": [[0]]})
+        self._stop_worker(hard=True)
+        self.assertEqual(self.query()["status"], "完成")  # done, cleanup owed
+        self.assertEqual(self.effects(), {"pending": [[0]]})
+        self.set_control(cancel="normal")
+        self._start_worker()
+        self.wait_until(lambda: self.effects()["pending"] == [],
+                        message="cancel confirmation after recovery")
+        self.assertEqual(self.query()["result"], [1, None])
+
+    def test_target_restart_keeps_artifacts_and_bans(self):
+        self.set_control(create="hang")
+        self.init(["竞速", ["采集", "x"], ["计时", 1]])
+        self._start_worker()
+        self.wait_until(
+            lambda: self.target_state()["artifacts"].get("[0]") == "x",
+            message="artifact visible")
+        self._stop_target(hard=True)
+        receipt = self.submit(["c1", "推进", 1])
+        self.assertEqual(receipt["result"], [1, None])
+        time.sleep(0.3)  # the target is down: no confirmation possible
+        self.assertEqual(self.effects(), {"pending": [[0]]})
+        self.target_proc = self._start_target()
+        self.wait_until(lambda: self.effects()["pending"] == [],
+                        message="cancel after target restart")
+        state = self.target_state()
+        self.assertEqual(state["artifacts"], {})
+        self.assertIn("[0]", state["banned"])
+
+    def test_race_between_two_collects(self):
+        self.init(["竞速", ["采集", "a"], ["采集", "b"]])
+        self._start_worker()
+        self.wait_until(lambda: self.query()["status"] == "完成",
+                        message="race done")
+        result = self.query()["result"]
+        winner = result[0]
+        self.assertIn(winner, (0, 1))
+        self.assertEqual(result[1], "ab"[winner])
+        loser = 1 - winner
+        self.wait_until(lambda: self.effects()["pending"] == [],
+                        message="loser cancelled")
+        state = self.target_state()
+        self.assertEqual(state["artifacts"],
+                         {flow_schema.canonical_json([winner]): "ab"[winner]})
+        self.assertIn(flow_schema.canonical_json([loser]), state["banned"])
+
+    def test_http_effects_endpoint(self):
+        self.init(["竞速", ["采集", "x"], ["计时", 1]])
+        # No worker: the cancellation duty is owed but cannot be confirmed.
+        receipt = self.submit(["c1", "推进", 1])
+        self.assertEqual(receipt["result"], [1, None])
+        port = _free_port()
+        server = subprocess.Popen(
+            [sys.executable, ENTRY, "serve", "--db", self.db,
+             "--port", str(port)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=ROOT)
+        try:
+            body = None
+            for _ in range(100):
+                try:
+                    with urllib.request.urlopen(
+                            "http://127.0.0.1:%d/effects" % port,
+                            timeout=1) as resp:
+                        body = json.loads(resp.read().decode())
+                    break
+                except Exception:
+                    time.sleep(0.05)
+            self.assertEqual(body, {"pending": [[0]]})
+            self._start_worker()
+            self.wait_until(
+                lambda: json.loads(urllib.request.urlopen(
+                    "http://127.0.0.1:%d/effects" % port, timeout=5)
+                    .read().decode())["pending"] == [],
+                message="effects cleared over HTTP")
+        finally:
+            server.terminate()
+            server.wait(timeout=10)
+
+    def test_record_create_response_directly(self):
+        # Store-level: recording an answer settles atomically, idempotently.
+        self.init(["串行", ["采集", "x"], ["计时", 1]])
+        store = flow_store.Store(self.db)
+        try:
+            self.assertTrue(store.record_create_response([0], "x"))
+            self.assertFalse(store.record_create_response([0], "x"))
+            self.assertEqual(store.query()["status"], "运行")
+            store.commit_command(["c", "推进", 1])
+            self.assertEqual(store.query()["result"], ["x", None])
+            self.assertEqual(store.effects_view(), {"pending": []})
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":

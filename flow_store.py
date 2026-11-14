@@ -19,6 +19,10 @@ Durability and atomicity:
   duplicate application cannot double-apply.
 * One ``RLock`` serialises commands inside the process; SQLite locking plus
   the revision guard extend that to other processes.
+* 采集 side effects live inside the same state JSON: activation intents,
+  their answers, cancellation duties and their confirmations all commit in
+  the same transaction as the settlement that produced them, so a restart
+  simply resumes from the persisted ledger.
 
 Idempotency:
 
@@ -40,11 +44,16 @@ from flow_engine import (
     backlog_ids,
     build_tree,
     clone,
+    effects_of,
+    node_at_address,
+    normalize,
+    pending_cancellations,
+    pending_create_ops,
     result_of,
     settle,
     status_of,
 )
-from flow_schema import FlowError, canonical_json
+from flow_schema import FlowError, ST_ACTIVE, canonical_json
 
 SCHEMA_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS meta (
@@ -139,7 +148,7 @@ class Store:
         ).fetchone()
         if row is None:
             raise FlowError("database is not initialised", [], kind="state")
-        return row["revision"], json.loads(row["state_json"])
+        return row["revision"], normalize(json.loads(row["state_json"]))
 
     def _save(self, revision: int, state: Dict[str, Any]) -> None:
         self.conn.execute(
@@ -163,6 +172,71 @@ class Store:
         with self._lock:
             _, state = self._load()
             return self.view(state)
+
+    # -- side-effect ledger (采集) --------------------------------------
+
+    def effects_view(self) -> Dict[str, Any]:
+        """The /effects object: addresses with unconfirmed cancellations."""
+        with self._lock:
+            _, state = self._load()
+            return {"pending": pending_cancellations(state)}
+
+    def pending_effects(self) -> Tuple[List[Dict[str, Any]], List[List[int]]]:
+        """(create operations, cancel addresses) the worker should act on."""
+        with self._lock:
+            _, state = self._load()
+            return pending_create_ops(state), pending_cancellations(state)
+
+    def create_pending(self, address: List[int]) -> bool:
+        """Whether a /create attempt for `address` is still meaningful."""
+        key = canonical_json(address)
+        with self._lock:
+            _, state = self._load()
+            intent = effects_of(state)["creates"].get(key)
+            if intent is None or intent["response"] is not None:
+                return False
+            leaf = node_at_address(state, intent["address"])
+            return leaf is not None and leaf["status"] == ST_ACTIVE
+
+    def cancel_pending(self, address: List[int]) -> bool:
+        """Whether the cancellation duty for `address` is unconfirmed."""
+        key = canonical_json(address)
+        with self._lock:
+            _, state = self._load()
+            duty = effects_of(state)["cancels"].get(key)
+            return duty is not None and not duty["confirmed"]
+
+    def record_create_response(self, address: List[int], data: str) -> bool:
+        """Persist a /create 200 answer and settle it in one transaction.
+
+        Serialised with commands exactly like another command: a still-active
+        leaf becomes ready at the current logical clock and settlement runs
+        to a fixpoint.  A late answer for a leaf that is no longer active is
+        recorded but changes nothing.  Returns False when the answer was
+        already recorded (idempotent retry).
+        """
+        key = canonical_json(address)
+        with self._txn():
+            revision, state = self._load()
+            intent = effects_of(state)["creates"].get(key)
+            if intent is None or intent["response"] is not None:
+                return False
+            intent["response"] = data
+            settle(state)
+            self._save(revision, state)
+            return True
+
+    def record_cancel_confirmation(self, address: List[int]) -> bool:
+        """Persist a /cancel 200 answer; False when already confirmed."""
+        key = canonical_json(address)
+        with self._txn():
+            revision, state = self._load()
+            duty = effects_of(state)["cancels"].get(key)
+            if duty is None or duty["confirmed"]:
+                return False
+            duty["confirmed"] = True
+            self._save(revision, state)
+            return True
 
     # -- init ----------------------------------------------------------
 

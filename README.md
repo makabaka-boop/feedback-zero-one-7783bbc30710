@@ -1,18 +1,21 @@
 # 流程后端（Python + SQLite，零第三方依赖）
 
-等待回调、可超时转备用的持久化流程引擎。初始化一次（时钟 0 与流程 E），
-之后接受“送达”和“推进”命令，并可随时查询。所有命令、结算与回执在同一个
-SQLite 事务中提交，强退只会看到完整的旧态或完整的新态。
+等待回调、可超时转备用、可远程采集的持久化流程引擎。初始化一次（时钟 0
+与流程 E），之后接受“送达”和“推进”命令，并可随时查询。所有命令、结算、
+回执与采集副作用账本在同一个 SQLite 事务中提交，强退只会看到完整的旧态
+或完整的新态。
 
 ## 文件
 
 | 文件 | 作用 |
 |---|---|
-| `flow_backend.py` | 交付入口：`init` / `query` / `submit` / `serve`（CLI + HTTP） |
+| `flow_backend.py` | 交付入口：`init` / `query` / `submit` / `effects` / `worker` / `serve`（CLI + HTTP） |
 | `flow_schema.py` | 流程与命令的校验、错误路径、JSON 编解码 |
-| `flow_engine.py` | 纯调度引擎：激活、完成传播、竞速取消、逐事件结算 |
-| `flow_store.py` | SQLite 持久化、事务、回执/幂等、初始化 |
-| `tests/acceptance.py` | 端到端验收（CLI、HTTP、并发、强退） |
+| `flow_engine.py` | 纯调度引擎：激活、完成传播、竞速取消、逐事件结算、副作用账本 |
+| `flow_store.py` | SQLite 持久化、事务、回执/幂等、初始化、应答落库 |
+| `flow_worker.py` | 独立副作用进程：对模拟目标执行 create/cancel 并重试 |
+| `flow_target.py` | 专属持久模拟目标：`/create` `/cancel` `/control` `/state` |
+| `tests/acceptance.py` | 端到端验收（CLI、HTTP、并发、强退、采集全流程） |
 
 ## 运行
 
@@ -30,11 +33,39 @@ python3 flow_backend.py submit --db flow.db --command '["s1","送达","name",nul
 # 查询
 python3 flow_backend.py query --db flow.db
 
+# 查询未确认撤销的采集地址
+python3 flow_backend.py effects --db flow.db
+# {"pending": []}
+
 # HTTP 服务
 python3 flow_backend.py serve --db flow.db --port 8080
 ```
 
 `--flow` / `--command` 接受 JSON 文本、`@文件` 或 `-`（stdin）。
+
+### 采集：模拟目标与独立进程
+
+含 `采集` 叶的流程需要一个专属持久模拟目标和一个独立 worker 进程：
+
+```bash
+# 模拟目标（每个流程库专属一个；状态持久，重启保留产物与封禁）
+python3 flow_target.py serve --db target.db --port 8090
+
+# 独立副作用进程（轮询账本、执行 HTTP、失败重试、应答落库并结算）
+python3 flow_backend.py worker --db flow.db --target http://127.0.0.1:8090
+```
+
+目标接口：
+
+| 方法 | 路径 | 请求体 | 响应 |
+|---|---|---|---|
+| POST | `/create` | `[键, data]` | 幂等创建，200 返回 JSON 字符串 `data`；键被封禁后 409 |
+| POST | `/cancel` | `键` | 幂等删除并永久封禁，200 返回 `null` |
+| GET | `/state` | – | `{"artifacts": {...}, "banned": [...], "stats": {...}}` |
+| POST/GET | `/control` | `{"create": 模式, "cancel": 模式, "hang": 秒}` | 故障注入：模式为 `normal`/`hang`/`disconnect` |
+
+`hang`/`disconnect` 都是“受理后”再挂起应答或断连（状态变更已生效），
+用于验收传输失败重试与迟到应答。键为原零基节点地址数组（如 `[0,2]`）。
 
 ### HTTP
 
@@ -44,6 +75,7 @@ python3 flow_backend.py serve --db flow.db --port 8080
 | POST | `/query` | 空 | 查询对象 |
 | GET | `/query` | – | 查询对象 |
 | POST | `/command` | `[id, op, ...]` | 回执（命令后查询对象） |
+| GET | `/effects` | – | `{"pending": [地址, ...]}` |
 | GET | `/health` | – | `{"ok": true, "db": "..."}` |
 
 拒绝返回 HTTP 400（重复初始化不同 E 为 409），体为
@@ -55,6 +87,7 @@ python3 flow_backend.py serve --db flow.db --port 8080
 ```
 ["等待", name]             等待
 ["计时", d]                计时
+["采集", data]             采集（远程产物，data 为字符串）
 ["串行", E, ...]           串行
 ["并行", E, ...]           并行
 ["竞速", E, ...]           竞速
@@ -64,6 +97,7 @@ python3 flow_backend.py serve --db flow.db --port 8080
 - `d`、`t`：非负整数，布尔值明确拒绝。
 - 组合至少一个子项，可任意嵌套；操作名必须为字符串。
 - 信号 `data` 为 JSON 字符串；回执/结果中的 `null` 因此不歧义。
+- 采集 `data` 为任意 JSON 字符串（含空串），非字符串拒绝（路径如 `$[1]`）。
 - 结果形状：串行/并行 `[子结果,...]`（原序）；竞速 `[胜者零基下标, 结果]`。
 
 ## 语义要点
@@ -75,6 +109,14 @@ python3 flow_backend.py serve --db flow.db --port 8080
 - **串行**依次激活，**并行**/**竞速**同时激活全部子项。
 - **竞速**第一个完成的子项获胜（候选胜者下标最小）并取消其余子树；
   已消费的信号不归还。
+- **采集**激活时把 create 意图（键=原零基节点地址数组）随状态原子落库；
+  独立 worker 进程据此调用模拟目标。`POST /create` 的 200 应答落库后，
+  仍活动的叶就绪并以其 `data` 完成，按当前逻辑时钟及原顺序结算，
+  与命令串行等价；传输失败（含受理后断连/挂起）幂等重试。
+- **撤销义务**：落败子树中全部已激活采集叶（含已完成叶、含 create 应答
+  仍悬挂的叶）随取消原子落库；worker 以 `POST /cancel` 确认，迟到应答
+  不改已结算结果。`GET /effects` 返回 `{pending: [...]}`（按整数字典序），
+  流程完成可仍待清理，通信恢复后清空。
 - **调度**：地址为根 `[]` 与零基子项路径。初始化和每条命令后，反复取
   “按整数字典序地址最小的就绪叶”（等待有同名积压，或计时到期）完成之，
   并立即传播完成/取消/新激活，直到稳定。每一步只完成一个叶，因此竞速的
@@ -106,4 +148,8 @@ python3 tests/acceptance.py
 - 完成后的提交、初始化零秒计时、CLI 重启后状态与回执保留；
 - 多进程并发提交（12 路）、并发重试；
 - 强退：写入进程 `SIGKILL` 后库可直接打开，无重复 id、回执与状态一致；
-- HTTP 全流程、拒绝码与错误路径、HTTP 进程重启后状态保留。
+- HTTP 全流程、拒绝码与错误路径、HTTP 进程重启后状态保留；
+- 采集：意图登记与完成、规格示例（create 挂起后 `推进 1` 得 `[1,null]`、
+  迟到应答不改结果、远端无产物）、已完成叶被祖先淘汰并撤销、
+  双采集竞速、worker 在远端受理后/本地确认前被强退后重启续行、
+  目标进程重启后产物与封禁保留、`/effects` 待清理与清空、非法新叶 400。

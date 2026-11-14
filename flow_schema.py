@@ -6,6 +6,7 @@ A *flow* is a JSON array:
 
     ["等待", name]                 wait for signal `name`
     ["计时", d]                    timer, d seconds from activation
+    ["采集", data]                 collect: create a remote artifact, await its data
     ["串行", E, ...]               serial: children activated one at a time
     ["并行", E, ...]               parallel: all children at once
     ["竞速", E, ...]               race: all children at once, first wins
@@ -29,6 +30,7 @@ from typing import Any, List
 
 OP_WAIT = "等待"
 OP_TIMER = "计时"
+OP_COLLECT = "采集"
 OP_SERIAL = "串行"
 OP_PARALLEL = "并行"
 OP_RACE = "竞速"
@@ -36,7 +38,7 @@ OP_RACE = "竞速"
 CMD_DELIVER = "送达"
 CMD_ADVANCE = "推进"
 
-FLOW_OPS = {OP_WAIT, OP_TIMER, OP_SERIAL, OP_PARALLEL, OP_RACE}
+FLOW_OPS = {OP_WAIT, OP_TIMER, OP_COLLECT, OP_SERIAL, OP_PARALLEL, OP_RACE}
 COMBO_OPS = {OP_SERIAL, OP_PARALLEL, OP_RACE}
 CMD_OPS = {CMD_DELIVER, CMD_ADVANCE}
 
@@ -134,6 +136,13 @@ def validate_flow(node: Any, path: List[int] | None = None) -> None:
                 "duration must be a non-negative integer (booleans rejected)",
                 path + [1],
             )
+        return
+
+    if op == OP_COLLECT:
+        if len(node) != 2:
+            raise FlowError("采集 takes exactly one data string", path, kind="structure")
+        if not isinstance(node[1], str):
+            raise FlowError("采集 data must be a JSON string", path + [1])
         return
 
     # 串行 / 并行 / 竞速

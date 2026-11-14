@@ -7,10 +7,13 @@ CLI
     python3 flow_backend.py init  --db flow.db --flow '["计时",5]'
     python3 flow_backend.py query --db flow.db
     python3 flow_backend.py submit --db flow.db --command '["c1","推进",5]'
+    python3 flow_backend.py effects --db flow.db
+    python3 flow_backend.py worker --db flow.db --target http://127.0.0.1:8090
     python3 flow_backend.py serve --db flow.db --port 8080
 
 `--flow` / `--command` accept the JSON text directly, `@path` reads it from a
-file, and `-` reads it from stdin.
+file, and `-` reads it from stdin.  `worker` runs the independent 采集
+side-effect process (see flow_worker.py); the mock target is flow_target.py.
 
 HTTP
 ----
@@ -18,6 +21,7 @@ HTTP
     POST /query                      -> query object
     GET  /query                      -> query object
     POST /command  body: [id, op, ...] -> receipt (post-command query object)
+    GET  /effects                    -> {"pending": [address, ...]}
     GET  /health                     -> {"ok": true, "db": "..."}
 
 Rejections use HTTP 400 (409 only for a conflicting re-initialisation) with:
@@ -51,6 +55,7 @@ from flow_schema import (
     validate_flow,
 )
 from flow_store import Store
+from flow_worker import run_worker
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +86,14 @@ def op_submit(db: str, command_text: Any) -> Any:
     store = Store(db)
     try:
         return store.commit_command(command)
+    finally:
+        store.close()
+
+
+def op_effects(db: str) -> Any:
+    store = Store(db, ensure_schema=False)
+    try:
+        return store.effects_view()
     finally:
         store.close()
 
@@ -137,9 +150,12 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/health":
                     return self._send(200, {"ok": True, "db": os.path.abspath(self.db_path)})
                 return self._send(200, {"service": "flow-backend", "endpoints": [
-                    "POST /init", "POST|GET /query", "POST /command"]})
+                    "POST /init", "POST|GET /query", "POST /command",
+                    "GET /effects"]})
             if method == "GET" and path == "/query":
                 return self._send(200, op_query(self.db_path))
+            if method == "GET" and path == "/effects":
+                return self._send(200, op_effects(self.db_path))
             if method == "POST" and path == "/init":
                 body = self._read_body()
                 payload = decode_json(body)
@@ -216,6 +232,24 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--db", required=True)
     submit.add_argument("--command", required=True, help="command JSON, @file or -")
 
+    effects = sub.add_parser(
+        "effects", help="print unconfirmed 采集 cancellations")
+    effects.add_argument("--db", required=True)
+
+    worker = sub.add_parser(
+        "worker", help="run the independent 采集 side-effect worker process")
+    worker.add_argument("--db", required=True)
+    worker.add_argument("--target", required=True,
+                        help="base URL of the dedicated mock target")
+    worker.add_argument("--interval", type=float, default=0.1,
+                        help="ledger scan interval in seconds")
+    worker.add_argument("--timeout", type=float, default=1.0,
+                        help="per-attempt HTTP timeout in seconds")
+    worker.add_argument("--retry", type=float, default=0.2,
+                        help="delay between retries in seconds")
+    worker.add_argument("--once", action="store_true",
+                        help="single pass, one attempt per pending effect, then exit")
+
     server = sub.add_parser("serve", help="run the HTTP API")
     server.add_argument("--db", required=True)
     server.add_argument("--host", default="127.0.0.1")
@@ -233,6 +267,12 @@ def main(argv: Optional[list] = None) -> int:
             print(ok_body(op_query(args.db)))
         elif args.mode == "submit":
             print(ok_body(op_submit(args.db, _read_arg(args.command))))
+        elif args.mode == "effects":
+            print(ok_body(op_effects(args.db)))
+        elif args.mode == "worker":
+            run_worker(args.db, args.target, interval=args.interval,
+                       timeout=args.timeout, retry=args.retry, once=args.once)
+            return 0
         elif args.mode == "serve":
             serve(args.db, args.host, args.port)
             return 0
